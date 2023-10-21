@@ -3,14 +3,43 @@ import struct
 import time
 from threading import Thread
 
-import serial.tools.list_ports
-import vgamepad as vg
+try: import serial.tools.list_ports
+except ModuleNotFoundError:
+    print ("You need to install 'pyserial' to run this program.\nTry this command: pip3 install pyserial")
+    quit(1)
 
-parser = argparse.ArgumentParser(description='DJI Mavic 3 RC231, RC-N1)')
-parser.add_argument('-p', '--port', help='RC Serial Port', default="COM9")
+parser = argparse.ArgumentParser(description='DJI Mavic 3 RC231 (RC-N1) <-> Gamepad interface.')
+parser.add_argument('-p', '--port', help='RC Serial Port - leave empty to scan - example: COM3')
+parser.add_argument('--driver', help='Driver Type', default='vgamepad', choices=['vgamepad', 'vjoy'])
+parser.add_argument('-d', '--device', help='VJoy Device ID - Only needed when using vjoy driver', type=int, default=1)
+parser.add_argument('-i', '--invert', help='Invert lv, lh, rv, rh, or cam axis', nargs='*', default=['lv', 'rv'])
 
 args = parser.parse_args()
-gamepad = vg.VX360Gamepad()
+invert = frozenset(args.invert)
+maxValue = 0x8000 # == 32768
+
+if args.driver == "vgamepad":
+    try: import vgamepad as vg
+    except ModuleNotFoundError:
+        print ("If you want to use vgamepad as driver, you'll need to install 'vgamepad' to run this program.\nTry this command: pip3 install vgamepad")
+        quit(1)
+    gamepad = vg.VX360Gamepad()
+elif args.driver == "vjoy":
+    try: import pyvjoy as vg
+    except ModuleNotFoundError:
+        print ("If you want to use vjoy as driver, you'll need to install 'pyvjoy' to run this program.\nTry this command: pip3 install pyvjoy")
+        quit(1)
+    class vGamepad(vg.VJoyDevice):
+        def left_joystick(self, h, v): self.data.wAxisX, self.data.wAxisY = h, v
+        def right_joystick(self, h, v): self.data.wAxisXRot, self.data.wAxisYRot = h, v
+        def press_button(self, button): self.data.lButtons |= button
+        def release_button(self, button): self.data.lButtons &= ~button
+        def left_trigger(self): return
+        def reset(self): super().reset();self.data.lButtons=0;self.left_joystick(0x4000, 0x4000),self.right_joystick(0x4000, 0x4000)
+        def shutdown(self): self.reset(),self.update(),self.__del__()
+    class XUSB_BUTTON:XUSB_GAMEPAD_A=1<<0;XUSB_GAMEPAD_B=1<<1;XUSB_GAMEPAD_X=1<<2;XUSB_GAMEPAD_Y=1<<3
+    vg.XUSB_BUTTON=XUSB_BUTTON()
+    gamepad = vGamepad(args.device)
 
 events = (
     gamepad.left_trigger,
@@ -123,25 +152,32 @@ def send_duml(s, source, target, cmd_type, cmd_set, cmd_id, payload = None):
 
     sequence_number += 1
 
-print('app version: 3.0.0\n')
+print('app version: 3.1.0\n')
 # Open serial.
 try:
+    if args.port:
+        s = serial.Serial(port=args.port, baudrate=115200)
+        print('Opened serial port:', s.name)
+    else:
+        result = []
+        ports = serial.tools.list_ports.comports(True)
 
-    result = []
-    ports = serial.tools.list_ports.comports(True)
-
-    for port in ports:
-        try:
-            print(port.description)
-            if port.description.find("For Protocol") != -1:
-                print("found DJI USB VCOM For Protocol")
-                s = serial.Serial(port=port.name, baudrate=115200)
-                print('Opened serial port:', s.name)
-            else:
-                print("skip")
-            result.append(port)
-        except (OSError, serial.SerialException):
-            pass
+        for port in ports:
+            try:
+                print(port.description)
+                if port.description.find("For Protocol") != -1:
+                    print("found DJI USB VCOM For Protocol")
+                    s = serial.Serial(port=port.name, baudrate=115200)
+                    print('Opened serial port:', s.name)
+                    break
+                else:
+                    print("skip")
+                result.append(port)
+            except (OSError, serial.SerialException):
+                pass
+        
+        try: s
+        except NameError: raise serial.SerialException("Unable to find the correct COM port.\nPerhaps try to supply the portname to the command by adding '-p <COM_PORT>'")
 
 except serial.SerialException as e:
     print('Could not open serial port:', e)
@@ -149,39 +185,50 @@ except serial.SerialException as e:
 
 # Stylistic: Newline for spacing.
 print('\nDji RC231 emulation started...\n')
-print('\nClose terminal to stop\n')
+print('\nTo stop, press Ctrl-C or close the terminal\n')
 
 print('*******************************************************\n')
 print('* Telegram: https://t.me/DJI_RC_N1_SIMULATOR_FLY_DC   *\n')
 print('* Donate: https://www.buymeacoffee.com/ivanyakymenko  *\n')
 print('*******************************************************\n')
 
-# Process input (min 364, center 1024, max 1684) -> (min 0, center 16384, max 32768)
+# Process input (min 364, center 1024, max 1684)
+inr = [364, 1684]
+if args.driver == 'vgamepad': outr = [-32768, 32767] # min -32768, max 32767
+elif args.driver == 'vjoy': outr = [0, 32767] # min 0, max 32768
 def parseInput(input, name):
-    output = (int.from_bytes(input, byteorder='little') - 1024) * 2 * 4096 // 165
-    if output >= 32768:
-        output = 32767
+    # Source: https://stackoverflow.com/a/929107
+    output = (((int.from_bytes(input, byteorder='little') - inr[0]) * (outr[1] - outr[0])) / (inr[1] - inr[0])) + outr[0]
 
-#    print(output, "test")
+    if name in invert:
+        if args.driver == 'vgamepad': output = -output
+        elif args.driver == 'vjoy': output = outr[1] - output
+
+    if args.driver == 'vjoy' and name == 'cam': output = output * 2 - outr[1]
+    
+    #print(output, "test")
 
     return output
 
-st = {"rh": 0, "rv": 0, "lh": 0, "lv": 0}
+st = {"rh": 0, "rv": 0, "lh": 0, "lv": 0, "cam": 0}
 
+stopping = False
 def threaded_function():
     while(True):
         time.sleep(0.1)
         #print("working ...")
         gamepad.left_joystick(int(st["lh"]), int(st["lv"]))
         gamepad.right_joystick(int(st["rh"]), int(st["rv"]))
-        if camera > 32000:
+        if st["cam"] > 32000:
             gamepad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_Y) #restart race
-        if camera < -32000:
+        elif st["cam"] < -32000:
             gamepad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_B) #recover drone
-        if camera == 0:
+        else:
             gamepad.release_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_Y)
             gamepad.release_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_B)
         gamepad.update()
+        if stopping: break
+    if args.driver == 'vjoy': gamepad.shutdown()
 
 thread = Thread(target = threaded_function, args = ())
 thread.start()
@@ -226,13 +273,13 @@ try:
         # Reverse-engineered. Controller input seems to always be len 38.
         if len(data) == 38:
             # Reverse-engineered
-            st["rh"] = parseInput(data[13:15], 'lv')
-            st["rv"] = parseInput(data[16:18], 'lh')
+            st["rh"] = parseInput(data[13:15], 'lh')
+            st["rv"] = parseInput(data[16:18], 'lv')
 
             st["lv"] = parseInput(data[19:21], 'rv')
             st["lh"] = parseInput(data[22:24], 'rh')
 
-            camera = parseInput(data[25:27], 'cam')
+            st["cam"] = parseInput(data[25:27], 'cam')
 
             #print(data)
             #with uinput.Device(events) as device:
@@ -241,7 +288,7 @@ try:
             # print(len(data))
 
             # Log to console.
-            #print('L: H{0:06d},V{1:06d}; R: H{2:06d},V{3:06d}, CAM: {4:06d}\n'.format(left_horizontal, left_vertical, right_horizontal, right_vertical, camera), end='')
+            #print('L: H{0:06d},V{1:06d}; R: H{2:06d},V{3:06d}, CAM: {4:06d}\n'.format(st["lh"], st["lv"], st["rh"], st["rv"], st["cam"]), end='')
 except serial.SerialException as e:
     # Stylistic: Newline to stop data update and spacing.
     print('\n\nCould not read/write:', e)
@@ -252,3 +299,6 @@ except KeyboardInterrupt:
     pass
 
 print('Stopping.')
+stopping = True
+thread.join()
+print('Stopped')
