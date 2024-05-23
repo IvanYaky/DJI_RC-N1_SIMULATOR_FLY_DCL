@@ -201,7 +201,7 @@ def parseInput(input, name):
     output = (((int.from_bytes(input, byteorder='little') - inr[0]) * (outr[1] - outr[0])) / (inr[1] - inr[0])) + outr[0]
 
     if name in invert:
-        if args.driver == 'vgamepad': output = -output
+        if args.driver == 'vgamepad': output = -output -1
         elif args.driver == 'vjoy': output = outr[1] - output
 
     if args.driver == 'vjoy' and name == 'cam': output = output * 2 - outr[1]
