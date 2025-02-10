@@ -131,6 +131,8 @@ try:
     result = []
     ports = serial.tools.list_ports.comports(True)
 
+    s = None
+
     for port in ports:
         try:
             print(port.description)
